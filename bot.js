@@ -1,4 +1,5 @@
 require('dotenv').config();
+const express    = require('express');
 const { Telegraf } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -343,7 +344,25 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// 11. LAUNCH — POLLING MODE (for Render / Railway)
+// 11. HEALTH SERVER — required by Render Free Web Service
+//
+//    Render's free tier expects the process to bind a port and
+//    respond to HTTP. This tiny Express server satisfies that
+//    requirement without interfering with Telegraf polling.
+// ─────────────────────────────────────────────────────────────
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (_req, res) => {
+  res.send('🤖 Fox Bot is running — Telegraf polling is active.');
+});
+
+app.listen(PORT, () => {
+  console.log(`🌐 Health server listening on port ${PORT}`);
+});
+
+// ─────────────────────────────────────────────────────────────
+// LAUNCH — POLLING MODE (for Render / Railway)
 //    Polling is reliable on free-tier hosts where webhook
 //    HTTPS certificates and static IPs are unavailable.
 // ─────────────────────────────────────────────────────────────
