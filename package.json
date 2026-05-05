@@ -1,0 +1,19 @@
+{
+  "name": "fox-telegram-bot-worker",
+  "version": "1.0.0",
+  "description": "Fox AI Micro-Learning — Telegram Bot Worker (Polling mode)",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.17.1",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3"
+  }
+}
