@@ -357,8 +357,8 @@ app.get('/', (_req, res) => {
   res.send('🤖 Fox Bot is running — Telegraf polling is active.');
 });
 
-app.listen(PORT, () => {
-  console.log(`🌐 Health server listening on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 Health server listening on 0.0.0.0:${PORT}`);
 });
 
 // ─────────────────────────────────────────────────────────────
