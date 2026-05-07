@@ -36,7 +36,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // responseMimeType forces Gemini to emit a JSON token stream so the reply
 // is always parseable — no markdown fences or prose wrapping to strip out.
 const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-pro',
+  model: 'gemini-1.5-flash',
   generationConfig: { responseMimeType: 'application/json' },
 });
 
