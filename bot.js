@@ -36,7 +36,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // responseMimeType forces Gemini to emit a JSON token stream so the reply
 // is always parseable — no markdown fences or prose wrapping to strip out.
 const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash-latest',
+  model: 'gemini-1.5-flash',
   generationConfig: { responseMimeType: 'application/json' },
 });
 
@@ -496,6 +496,13 @@ bot.launch({
     process.exit(1);
   });
 
-// Graceful shutdown
-process.once('SIGINT',  () => { console.log('Shutting down (SIGINT)…');  bot.stop('SIGINT');  });
-process.once('SIGTERM', () => { console.log('Shutting down (SIGTERM)…'); bot.stop('SIGTERM'); });
+// Graceful shutdown — stops Telegraf polling before the process exits,
+// preventing a 409 Conflict on the next deploy when two instances overlap.
+process.once('SIGINT',  () => {
+  console.log('Shutting down (SIGINT)…');
+  bot.stop('SIGINT');
+});
+process.once('SIGTERM', () => {
+  console.log('Shutting down (SIGTERM)…');
+  bot.stop('SIGTERM');
+});
