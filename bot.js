@@ -32,7 +32,13 @@ const supabase = createClient(
 );
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// responseMimeType forces Gemini to emit a JSON token stream so the reply
+// is always parseable — no markdown fences or prose wrapping to strip out.
+const geminiModel = genAI.getGenerativeModel({
+  model: 'gemini-1.5-flash',
+  generationConfig: { responseMimeType: 'application/json' },
+});
 
 // ─────────────────────────────────────────────────────────────
 // 3. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
@@ -84,21 +90,43 @@ async function processQueue() {
       return;
     }
 
-    // ── Step B: Build dynamic prompt ────────────────────────
+    // ── Step B: Build structured JSON prompt ────────────────
     const prompt = buildPrompt(user, userMessage);
 
-    // ── Step C: Call Gemini ──────────────────────────────────
-    const result       = await geminiModel.generateContent(prompt);
-    const responseText = result.response.text();
+    // ── Step C: Call Gemini, parse JSON response ─────────────
+    const result  = await geminiModel.generateContent(prompt);
+    const rawText = result.response.text();
 
-    await ctx.reply(responseText, { parse_mode: 'Markdown' });
+    let feedback, score;
+    try {
+      ({ feedback, score } = parseGeminiJSON(rawText));
+    } catch (parseErr) {
+      // Gemini returned something unparseable — log the raw output and
+      // fall back to sending it as plain text so the student isn't left hanging
+      console.error('[Queue] JSON parse failed. Raw Gemini output:', rawText);
+      console.error('[Queue] Parse error:', parseErr.message);
+      await ctx.reply(
+        rawText.length > 0
+          ? rawText
+          : '⚠️ I had trouble formatting my response. Please try again.'
+      );
+      isProcessing = false;
+      setTimeout(processQueue, QUEUE_DELAY_MS);
+      return;
+    }
 
-    // ── Step D: Log progress entry ───────────────────────────
+    // ── Step D: Reply with feedback only ────────────────────
+    await ctx.reply(feedback);
+
+    // ── Step E: Silently log score to progress_logs ──────────
+    await logUserProgress(telegramId, score, extractTopic(userMessage));
+
+    // ── Step F: Also update the existing progress table ──────
     await supabase.from('progress').insert({
       user_id:    user.id,
       topic:      extractTopic(userMessage),
-      evaluation: 'completed',
-      mistakes:   [],          // TODO: parse from Gemini response in v2
+      evaluation: `Score: ${score}/10`,
+      mistakes:   [],
       timestamp:  new Date().toISOString(),
     });
 
@@ -127,34 +155,41 @@ async function processQueue() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. PROMPT BUILDER
+// 4. PROMPT BUILDER — returns a JSON-schema-aware system prompt
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(user, userMessage) {
   const dailyMin = user.daily_time ?? 10;
   return `
-You are Fox, a strict, sharp, and encouraging AI micro-learning coach.
+You are a strict, sharp, and encouraging AI micro-learning mentor.
 
-**Student Profile:**
+Student Profile:
 - Name: ${user.full_name}
 - Learning Goal: ${user.goal}
 - Current Level: ${user.level}
 - Daily Study Budget: ${dailyMin} minutes
 
-**Student's Message:**
-"${userMessage}"
+Student's Message: "${userMessage}"
 
-**Your Response Rules (follow exactly):**
-1. Be concise — the student has only ${dailyMin} minutes today. No fluff.
-2. If the student answered a question or exercise:
-   a. State clearly whether they are CORRECT ✅ or INCORRECT ❌.
-   b. If incorrect, pinpoint the exact mistake in ONE sentence.
-   c. Provide the correct answer with a brief explanation (2–3 sentences max).
-3. After correcting/confirming, immediately present the next challenge:
-   - A short question, fill-in-the-blank, or real-world mini-scenario.
-   - Tie it directly to their goal: "${user.goal}".
-4. End with one motivational line. Keep it genuine, not generic.
-5. Use simple Markdown (bold, bullet points) to make the response easy to read on Telegram.
-6. Reply in the SAME LANGUAGE the student used in their message.
+CRITICAL OUTPUT RULE:
+You MUST reply ONLY with a valid JSON object — no markdown fences, no prose outside the JSON.
+The object must have exactly two keys:
+  "feedback" : string  — your educational response, correction if needed, and the next exercise or question. Use plain text with Telegram-friendly formatting (no HTML). Reply in the SAME LANGUAGE the student used.
+  "score"    : integer — a whole number from 0 to 10 evaluating the quality of the student's answer (0 = no answer / completely wrong, 10 = perfect). If the student asked a question rather than answering one, set score to 5.
+
+Scoring rubric:
+  0–3  : Incorrect or irrelevant answer.
+  4–6  : Partially correct; shows some understanding.
+  7–9  : Mostly correct with minor gaps.
+  10   : Completely correct and precise.
+
+Feedback rules:
+1. If the answer is wrong, pinpoint the exact mistake in ONE sentence, then give the correct answer in 2–3 sentences.
+2. Always end with one genuinely motivational line (not generic).
+3. Immediately present the next challenge tied to the goal: "${user.goal}".
+4. Be concise — the student has only ${dailyMin} minutes today.
+
+Example of the required output format (do not copy the content, only the structure):
+{"feedback":"✅ Correct! ... Here is your next question: ...","score":8}
 `.trim();
 }
 
@@ -165,6 +200,55 @@ You are Fox, a strict, sharp, and encouraging AI micro-learning coach.
 /** Naively extract a short topic label from the user message for progress logs. */
 function extractTopic(message) {
   return message.slice(0, 80).trim();
+}
+
+/**
+ * Parse the raw Gemini text into { feedback, score }.
+ * Gemini is configured with responseMimeType:'application/json' so the
+ * response should already be clean JSON, but we strip any accidental
+ * markdown fences defensively before parsing.
+ *
+ * @param {string} raw
+ * @returns {{ feedback: string, score: number }}
+ */
+function parseGeminiJSON(raw) {
+  // Strip ```json ... ``` or ``` ... ``` fences if present
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  const parsed  = JSON.parse(cleaned);
+
+  if (typeof parsed.feedback !== 'string' || parsed.feedback.trim() === '') {
+    throw new Error('Gemini JSON missing "feedback" string.');
+  }
+  const score = parseInt(parsed.score, 10);
+  if (isNaN(score) || score < 0 || score > 10) {
+    throw new Error(`Gemini JSON "score" out of range: ${parsed.score}`);
+  }
+  return { feedback: parsed.feedback.trim(), score };
+}
+
+/**
+ * Silently insert a scored session into progress_logs.
+ * Failures are logged but never surface to the Telegram user.
+ *
+ * @param {number} telegramId
+ * @param {number} score  0–10
+ * @param {string} topic  short label extracted from the user message
+ */
+async function logUserProgress(telegramId, score, topic) {
+  try {
+    const { error } = await supabase
+      .from('progress_logs')
+      .insert({
+        telegram_id: telegramId,
+        score,
+        topic:       topic.slice(0, 120),
+        created_at:  new Date().toISOString(),
+      });
+    if (error) throw error;
+  } catch (err) {
+    // Silent — a logging failure must never interrupt the student's session
+    console.error('[logUserProgress] Failed to log score:', err?.message ?? err);
+  }
 }
 
 /** Fetch user by telegram_id — returns null if not found or banned. */
