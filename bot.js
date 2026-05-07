@@ -36,7 +36,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // responseMimeType forces Gemini to emit a JSON token stream so the reply
 // is always parseable — no markdown fences or prose wrapping to strip out.
 const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash',
+  model: 'gemini-1.5-pro',
   generationConfig: { responseMimeType: 'application/json' },
 });
 
@@ -482,9 +482,15 @@ app.listen(PORT, '0.0.0.0', () => {
 //    Polling is reliable on free-tier hosts where webhook
 //    HTTPS certificates and static IPs are unavailable.
 // ─────────────────────────────────────────────────────────────
+// Delete any existing webhook and drop ghost sessions before polling starts.
+// This is the definitive fix for 409 Conflict on Render redeploys.
+bot.telegram.deleteWebhook({ drop_pending_updates: true })
+  .then(() => console.log('✅ Webhook deleted — ghost sessions cleared.'))
+  .catch((e) => console.warn('⚠️  deleteWebhook failed (non-fatal):', e.message));
+
 bot.launch({
   allowedUpdates: ['message', 'callback_query'],
-  dropPendingUpdates: true,   // discard stale messages from while bot was offline
+  dropPendingUpdates: true,
 })
   .then(() => {
     console.log('🤖 Fox Telegram Bot Worker running in Polling mode...');
