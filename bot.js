@@ -1,5 +1,5 @@
 require('dotenv').config();
-const express    = require('express');
+const express      = require('express');
 const { Telegraf } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -33,52 +33,36 @@ const supabase = createClient(
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// gemini-pro: legacy alias, widest availability on free tier.
-// No generationConfig, no systemInstruction — all persona & JSON rules go in the prompt.
-const geminiModel = genAI.getGenerativeModel({ model: 'gemini-pro' });
+// gemini-2.5-flash: confirmed available on this API key.
+// systemInstruction sets the persona at the model level.
+// responseMimeType enforces strict JSON output — no fences, no prose.
+const geminiModel = genAI.getGenerativeModel({
+  model: 'gemini-2.5-flash',
+  systemInstruction:
+    'You are a strict Security+ mentor. Evaluate the user\'s answer. ' +
+    'Reply ONLY with a valid JSON object containing exactly two keys: ' +
+    '"feedback" (string: your educational response and the next question) ' +
+    'and "score" (integer 0–10 evaluating the quality of their answer). ' +
+    'Do not include any text, markdown, or code blocks outside the JSON object.',
+  generationConfig: {
+    responseMimeType: 'application/json',
+  },
+});
 
 // ─────────────────────────────────────────────────────────────
-// 3. DIAGNOSTIC — list every model the API key can access
-// ─────────────────────────────────────────────────────────────
-async function scanModels() {
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`
-    );
-    const data = await response.json();
-    if (!response.ok) {
-      console.error('🔴 scanModels HTTP error:', response.status, JSON.stringify(data));
-      return;
-    }
-    console.log('🟢 AVAILABLE GOOGLE MODELS:');
-    if (data.models?.length) {
-      data.models.forEach((m) => console.log(' •', m.name));
-    } else {
-      console.log('  (no models returned — check API key permissions)');
-    }
-  } catch (e) {
-    console.error('🔴 Failed to scan models:', e.message);
-  }
-}
-scanModels();
-
-// ─────────────────────────────────────────────────────────────
-// 4. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
+// 3. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
 //
 //    Free tier allows ~10–15 requests/min (≈1 req/6 s).
 //    Each queue item waits QUEUE_DELAY_MS before the next
 //    one begins, smoothing bursts into a controlled stream.
 // ─────────────────────────────────────────────────────────────
-const QUEUE_DELAY_MS = 5_000;   // 5 s between Gemini calls → safe at free tier
-const MAX_QUEUE_SIZE = 50;      // drop oldest if flooded
+const QUEUE_DELAY_MS = 5_000;
+const MAX_QUEUE_SIZE = 50;
 
 /** @type {Array<{ ctx: import('telegraf').Context, telegramId: number, userMessage: string }>} */
 const messageQueue = [];
 let isProcessing   = false;
 
-/**
- * Drain the queue one item at a time, respecting QUEUE_DELAY_MS between calls.
- */
 async function processQueue() {
   if (isProcessing || messageQueue.length === 0) return;
   isProcessing = true;
@@ -93,7 +77,6 @@ async function processQueue() {
       .eq('telegram_id', telegramId)
       .single();
 
-    // User not found or was deleted/banned by admin
     if (dbError || !user) {
       await ctx.reply(
         '⛔ Your account is not registered or has been suspended by the admin.\n' +
@@ -104,7 +87,6 @@ async function processQueue() {
       return;
     }
 
-    // Soft-ban: admin set is_active = false without deleting the row
     if (!user.is_active) {
       await ctx.reply('⛔ Your account has been deactivated. Contact support if this is a mistake.');
       isProcessing = false;
@@ -112,19 +94,11 @@ async function processQueue() {
       return;
     }
 
-    // ── DIAGNOSTIC MODE: Gemini call temporarily disabled ────
-    // Re-enable Steps B–F once scanModels() confirms the correct model name.
-    await ctx.reply('🔧 System in diagnostic mode. Please wait for the admin to check the logs.');
-    isProcessing = false;
-    setTimeout(processQueue, QUEUE_DELAY_MS);
-    return;
+    // ── Step B: Build prompt ─────────────────────────────────
+    const prompt = buildPrompt(user, userMessage);
 
-    /* eslint-disable no-unreachable */
-    // ── Step B: Build full prompt with persona + JSON rules ──
-    const fullPrompt = buildPrompt(user, userMessage);
-
-    // ── Step C: Call Gemini, parse JSON response ─────────────
-    const result  = await geminiModel.generateContent(fullPrompt);
+    // ── Step C: Call Gemini, parse structured JSON response ──
+    const result  = await geminiModel.generateContent(prompt);
     const rawText = result.response.text();
 
     let feedback, score;
@@ -146,13 +120,13 @@ async function processQueue() {
       return;
     }
 
-    // ── Step D: Reply with feedback only ────────────────────
+    // ── Step D: Send only the feedback text to the student ───
     await ctx.reply(feedback);
 
     // ── Step E: Silently log score to progress_logs ──────────
     await logUserProgress(telegramId, score, extractTopic(userMessage));
 
-    // ── Step F: Also update the existing progress table ──────
+    // ── Step F: Update the main progress table ───────────────
     await supabase.from('progress').insert({
       user_id:    user.id,
       topic:      extractTopic(userMessage),
@@ -164,17 +138,15 @@ async function processQueue() {
   } catch (err) {
     console.error('[Queue] Processing error:', err?.message ?? err);
 
-    // Distinguish Gemini rate-limit errors (429) from other failures
     const isRateLimit = err?.message?.includes('429') || err?.status === 429;
     if (isRateLimit) {
       await ctx.reply(
         '⏳ Fox is a little busy right now (too many lessons at once!).\n' +
         'Your request is queued — try again in 30 seconds.'
       );
-      // Re-queue the item at the front so it retries after back-off
       messageQueue.unshift({ ctx, telegramId, userMessage });
       isProcessing = false;
-      setTimeout(processQueue, 30_000);   // back-off 30 s on rate limit
+      setTimeout(processQueue, 30_000);
       return;
     }
 
@@ -186,70 +158,51 @@ async function processQueue() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. PROMPT BUILDER — full persona + JSON rules injected inline
-//    (gemini-pro has no systemInstruction or generationConfig)
+// 4. PROMPT BUILDER
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(user, userMessage) {
   const dailyMin = user.daily_time ?? 10;
-  const fullPrompt = `You are a strict, encouraging AI micro-learning mentor. Your student's name is ${user.full_name}, their learning goal is "${user.goal}", their level is ${user.level}, and they have ${dailyMin} minutes today.
-
-You MUST evaluate the following student message and reply ONLY with a raw JSON object containing exactly two keys: "feedback" (string: your correction, explanation, and next question — plain text, no HTML, same language as the student) and "score" (integer 0 to 10: how correct their answer was; use 5 if they asked a question instead of answering one). Do not include markdown formatting, code blocks, backticks, or any text outside the JSON object. Your entire reply must start with { and end with }.
+  return `Student Profile:
+- Name: ${user.full_name}
+- Learning Goal: ${user.goal}
+- Level: ${user.level}
+- Daily budget: ${dailyMin} minutes
 
 Student's message: "${userMessage}"
 
-Reply now with only the JSON object:`;
-  return fullPrompt;
+Evaluate the student's message. Reply with only a valid JSON object with keys "feedback" and "score".`;
 }
 
 // ─────────────────────────────────────────────────────────────
 // 5. HELPERS
 // ─────────────────────────────────────────────────────────────
 
-/** Naively extract a short topic label from the user message for progress logs. */
 function extractTopic(message) {
   return message.slice(0, 80).trim();
 }
 
 /**
- * Strip all markdown code-block formatting from a Gemini response string
- * and return clean text ready for JSON.parse().
- *
- * Handles every variant Gemini produces in practice:
- *   ```json\n{...}\n```
- *   ```\n{...}\n```
- *   `{...}`          (single-backtick inline)
- *   {... }           (already clean — returned as-is)
- *
- * @param {string} raw
- * @returns {string}
+ * Strip markdown code-block fences from a Gemini response string.
+ * Handles ```json ... ```, ``` ... ```, and single-backtick wrapping.
  */
 function stripMarkdownFences(raw) {
   let s = raw.trim();
-
-  // Remove triple-backtick fences with optional language tag, e.g. ```json\n...\n```
-  // The [\s\S]*? matches across newlines; the gi flags handle any capitalisation.
-  const tripleMatch = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/gi);
+  const tripleMatch = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   if (tripleMatch) {
-    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    s = tripleMatch[1].trim();
+  } else if (s.startsWith('`') && s.endsWith('`')) {
+    s = s.slice(1, -1).trim();
   }
-
-  // Remove single-backtick wrapping, e.g. `{...}`
-  if (s.startsWith('`') && s.endsWith('`')) {
-    s = s.slice(1, -1);
-  }
-
-  return s.trim();
+  return s;
 }
 
 /**
- * Parse the raw Gemini text into { feedback, score }.
- *
- * @param {string} raw
- * @returns {{ feedback: string, score: number }}
+ * Parse raw Gemini output into { feedback: string, score: number }.
+ * stripMarkdownFences runs first so JSON.parse always receives clean input.
  */
 function parseGeminiJSON(raw) {
   const cleaned = stripMarkdownFences(raw);
-  const parsed  = JSON.parse(cleaned);   // throws SyntaxError if still not valid JSON
+  const parsed  = JSON.parse(cleaned);
 
   if (typeof parsed.feedback !== 'string' || parsed.feedback.trim() === '') {
     throw new Error('Gemini JSON missing "feedback" string.');
@@ -263,11 +216,7 @@ function parseGeminiJSON(raw) {
 
 /**
  * Silently insert a scored session into progress_logs.
- * Failures are logged but never surface to the Telegram user.
- *
- * @param {number} telegramId
- * @param {number} score  0–10
- * @param {string} topic  short label extracted from the user message
+ * Failures are logged server-side and never reach the student.
  */
 async function logUserProgress(telegramId, score, topic) {
   try {
@@ -276,17 +225,16 @@ async function logUserProgress(telegramId, score, topic) {
       .insert({
         telegram_id: telegramId,
         score,
-        topic:       topic.slice(0, 120),
-        created_at:  new Date().toISOString(),
+        topic:      topic.slice(0, 120),
+        created_at: new Date().toISOString(),
       });
     if (error) throw error;
   } catch (err) {
-    // Silent — a logging failure must never interrupt the student's session
     console.error('[logUserProgress] Failed to log score:', err?.message ?? err);
   }
 }
 
-/** Fetch user by telegram_id — returns null if not found or banned. */
+/** Fetch active user by telegram_id — returns null if not found or banned. */
 async function getActiveUser(telegramId) {
   const { data, error } = await supabase
     .from('users')
@@ -299,19 +247,11 @@ async function getActiveUser(telegramId) {
 
 // ─────────────────────────────────────────────────────────────
 // 6. /start — DEEP LINKING (website → Telegram account claim)
-//
-//    Flow: user completes onboarding on site → site creates a
-//    users row with a temp telegram_id and returns the UUID →
-//    site redirects to t.me/BOT?start=UUID →
-//    this handler updates the row with the real telegram_id
-//    and activates the account.
 // ─────────────────────────────────────────────────────────────
 bot.start(async (ctx) => {
-  const supabaseUserId = ctx.startPayload;   // UUID passed via deep link
-  const telegramId     = ctx.from.id;        // real Telegram numeric ID
-  const firstName      = ctx.from.first_name ?? 'learner';
+  const supabaseUserId = ctx.startPayload;
+  const telegramId     = ctx.from.id;
 
-  // Plain /start — no deep-link payload
   if (!supabaseUserId) {
     return ctx.reply(
       `👋 Welcome to *Fox AI*!\n\n` +
@@ -322,7 +262,6 @@ bot.start(async (ctx) => {
   }
 
   try {
-    // Check if this Telegram ID is already linked to ANY account
     const existingUser = await getActiveUser(telegramId);
     if (existingUser) {
       return ctx.reply(
@@ -332,13 +271,9 @@ bot.start(async (ctx) => {
       );
     }
 
-    // Claim the pre-created onboarding row
     const { data, error } = await supabase
       .from('users')
-      .update({
-        telegram_id: telegramId,
-        is_active:   true,
-      })
+      .update({ telegram_id: telegramId, is_active: true })
       .eq('id', supabaseUserId)
       .select('full_name, goal, level, daily_time')
       .single();
@@ -363,7 +298,6 @@ bot.start(async (ctx) => {
       `Type *"Start"* to get your very first lesson! 🦊`,
       { parse_mode: 'Markdown' }
     );
-
   } catch (err) {
     console.error('[/start] Unexpected error:', err?.message ?? err);
     ctx.reply('⚠️ An internal error occurred during account linking. Please try again.');
@@ -375,11 +309,8 @@ bot.start(async (ctx) => {
 // ─────────────────────────────────────────────────────────────
 bot.command('progress', async (ctx) => {
   const telegramId = ctx.from.id;
-
   const user = await getActiveUser(telegramId);
-  if (!user) {
-    return ctx.reply('⛔ Account not found. Visit the website to register.');
-  }
+  if (!user) return ctx.reply('⛔ Account not found. Visit the website to register.');
 
   const { data: sessions, error } = await supabase
     .from('progress')
@@ -393,9 +324,7 @@ bot.command('progress', async (ctx) => {
   }
 
   const lines = sessions.map((s, i) => {
-    const date = new Date(s.timestamp).toLocaleDateString('en-GB', {
-      day: '2-digit', month: 'short',
-    });
+    const date = new Date(s.timestamp).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
     return `${i + 1}. *${s.topic.slice(0, 40)}* — ${date}`;
   });
 
@@ -428,25 +357,18 @@ bot.on('text', async (ctx) => {
   const telegramId  = ctx.from.id;
   const userMessage = ctx.message.text.trim();
 
-  // Guard: ignore empty messages
   if (!userMessage) return;
 
-  // Guard: queue overflow protection
   if (messageQueue.length >= MAX_QUEUE_SIZE) {
-    return ctx.reply(
-      '⚠️ Fox is under heavy load right now. Please wait a moment and try again.'
-    );
+    return ctx.reply('⚠️ Fox is under heavy load right now. Please wait a moment and try again.');
   }
 
-  // Acknowledge receipt immediately (cheap — no Gemini call)
   const position = messageQueue.length + (isProcessing ? 1 : 0);
   const waitMsg  = position > 0
     ? `⏳ Analysing... (you are #${position + 1} in the queue)`
     : '⏳ Analysing your message...';
 
   await ctx.reply(waitMsg);
-
-  // Push to queue
   messageQueue.push({ ctx, telegramId, userMessage });
   processQueue();
 });
@@ -464,10 +386,6 @@ process.on('unhandledRejection', (reason) => {
 
 // ─────────────────────────────────────────────────────────────
 // 11. HEALTH SERVER — required by Render Free Web Service
-//
-//    Render's free tier expects the process to bind a port and
-//    respond to HTTP. This tiny Express server satisfies that
-//    requirement without interfering with Telegraf polling.
 // ─────────────────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -481,12 +399,8 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// LAUNCH — POLLING MODE (for Render / Railway)
-//    Polling is reliable on free-tier hosts where webhook
-//    HTTPS certificates and static IPs are unavailable.
+// 12. LAUNCH — POLLING MODE
 // ─────────────────────────────────────────────────────────────
-// Delete any existing webhook and drop ghost sessions before polling starts.
-// This is the definitive fix for 409 Conflict on Render redeploys.
 bot.telegram.deleteWebhook({ drop_pending_updates: true })
   .then(() => console.log('✅ Webhook deleted — ghost sessions cleared.'))
   .catch((e) => console.warn('⚠️  deleteWebhook failed (non-fatal):', e.message));
@@ -505,13 +419,6 @@ bot.launch({
     process.exit(1);
   });
 
-// Graceful shutdown — stops Telegraf polling before the process exits,
-// preventing a 409 Conflict on the next deploy when two instances overlap.
-process.once('SIGINT',  () => {
-  console.log('Shutting down (SIGINT)…');
-  bot.stop('SIGINT');
-});
-process.once('SIGTERM', () => {
-  console.log('Shutting down (SIGTERM)…');
-  bot.stop('SIGTERM');
-});
+// Graceful shutdown — prevents 409 Conflict on Render redeploys
+process.once('SIGINT',  () => { console.log('Shutting down (SIGINT)…');  bot.stop('SIGINT');  });
+process.once('SIGTERM', () => { console.log('Shutting down (SIGTERM)…'); bot.stop('SIGTERM'); });
