@@ -101,13 +101,18 @@ async function processQueue() {
     try {
       ({ feedback, score } = parseGeminiJSON(rawText));
     } catch (parseErr) {
-      // Gemini returned something unparseable — log the raw output and
-      // fall back to sending it as plain text so the student isn't left hanging
-      console.error('[Queue] JSON parse failed. Raw Gemini output:', rawText);
-      console.error('[Queue] Parse error:', parseErr.message);
+      // ── Full debug dump so Render logs show exactly what Gemini returned ──
+      console.error('━━━ [Queue] Gemini JSON parse failure ━━━');
+      console.error('Error  :', parseErr.message);
+      // JSON.stringify reveals invisible characters (newlines, BOM, etc.)
+      console.error('Raw    :', JSON.stringify(rawText));
+      console.error('Cleaned:', JSON.stringify(stripMarkdownFences(rawText)));
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+      // Fallback: send the raw text if it has content, otherwise a safe message
       await ctx.reply(
-        rawText.length > 0
-          ? rawText
+        rawText && rawText.trim().length > 0
+          ? rawText.trim()
           : '⚠️ I had trouble formatting my response. Please try again.'
       );
       isProcessing = false;
@@ -203,18 +208,45 @@ function extractTopic(message) {
 }
 
 /**
+ * Strip all markdown code-block formatting from a Gemini response string
+ * and return clean text ready for JSON.parse().
+ *
+ * Handles every variant Gemini produces in practice:
+ *   ```json\n{...}\n```
+ *   ```\n{...}\n```
+ *   `{...}`          (single-backtick inline)
+ *   {... }           (already clean — returned as-is)
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+function stripMarkdownFences(raw) {
+  let s = raw.trim();
+
+  // Remove triple-backtick fences with optional language tag, e.g. ```json\n...\n```
+  // The [\s\S]*? matches across newlines; the gi flags handle any capitalisation.
+  const tripleMatch = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/gi);
+  if (tripleMatch) {
+    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  }
+
+  // Remove single-backtick wrapping, e.g. `{...}`
+  if (s.startsWith('`') && s.endsWith('`')) {
+    s = s.slice(1, -1);
+  }
+
+  return s.trim();
+}
+
+/**
  * Parse the raw Gemini text into { feedback, score }.
- * Gemini is configured with responseMimeType:'application/json' so the
- * response should already be clean JSON, but we strip any accidental
- * markdown fences defensively before parsing.
  *
  * @param {string} raw
  * @returns {{ feedback: string, score: number }}
  */
 function parseGeminiJSON(raw) {
-  // Strip ```json ... ``` or ``` ... ``` fences if present
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-  const parsed  = JSON.parse(cleaned);
+  const cleaned = stripMarkdownFences(raw);
+  const parsed  = JSON.parse(cleaned);   // throws SyntaxError if still not valid JSON
 
   if (typeof parsed.feedback !== 'string' || parsed.feedback.trim() === '') {
     throw new Error('Gemini JSON missing "feedback" string.');
