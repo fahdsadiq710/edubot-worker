@@ -33,11 +33,10 @@ const supabase = createClient(
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// responseMimeType forces Gemini to emit a JSON token stream so the reply
-// is always parseable — no markdown fences or prose wrapping to strip out.
+// gemini-1.0-pro: universally available on free tier, no generationConfig needed.
+// JSON is enforced entirely via the prompt instruction + manual parsing.
 const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash',
-  generationConfig: { responseMimeType: 'application/json' },
+  model: 'gemini-1.0-pro',
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -160,7 +159,7 @@ async function processQueue() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. PROMPT BUILDER — returns a JSON-schema-aware system prompt
+// 4. PROMPT BUILDER — manual JSON enforcement for gemini-1.0-pro
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(user, userMessage) {
   const dailyMin = user.daily_time ?? 10;
@@ -175,26 +174,39 @@ Student Profile:
 
 Student's Message: "${userMessage}"
 
-CRITICAL OUTPUT RULE:
-You MUST reply ONLY with a valid JSON object — no markdown fences, no prose outside the JSON.
-The object must have exactly two keys:
-  "feedback" : string  — your educational response, correction if needed, and the next exercise or question. Use plain text with Telegram-friendly formatting (no HTML). Reply in the SAME LANGUAGE the student used.
-  "score"    : integer — a whole number from 0 to 10 evaluating the quality of the student's answer (0 = no answer / completely wrong, 10 = perfect). If the student asked a question rather than answering one, set score to 5.
+CRITICAL OUTPUT RULE — READ THIS FIRST:
+You MUST respond with a raw, valid JSON object containing EXACTLY two keys: "feedback" and "score".
+Do NOT add any text, explanation, or markdown outside the JSON object.
+Do NOT wrap the JSON in code blocks or backticks.
+Your entire response must start with { and end with }.
+
+JSON schema:
+{
+  "feedback": "<string: your educational response in the student's language, plain text only, no HTML>",
+  "score": <integer 0–10>
+}
 
 Scoring rubric:
   0–3  : Incorrect or irrelevant answer.
   4–6  : Partially correct; shows some understanding.
   7–9  : Mostly correct with minor gaps.
   10   : Completely correct and precise.
+  5    : Student asked a question (not answering one).
 
 Feedback rules:
-1. If the answer is wrong, pinpoint the exact mistake in ONE sentence, then give the correct answer in 2–3 sentences.
-2. Always end with one genuinely motivational line (not generic).
-3. Immediately present the next challenge tied to the goal: "${user.goal}".
+1. If the answer is wrong, state the mistake in ONE sentence, then give the correct answer in 2–3 sentences.
+2. Always follow up with the next exercise or question tied to the goal: "${user.goal}".
+3. End with one short motivational line.
 4. Be concise — the student has only ${dailyMin} minutes today.
 
-Example of the required output format (do not copy the content, only the structure):
-{"feedback":"✅ Correct! ... Here is your next question: ...","score":8}
+VALID example (structure only — do not copy content):
+{"feedback":"❌ Not quite. The correct answer is X because Y. Try this next: Z?","score":3}
+
+INVALID examples (never do this):
+\`\`\`json
+{"feedback":"...","score":3}
+\`\`\`
+Here is my response: {"feedback":"...","score":3}
 `.trim();
 }
 
