@@ -33,11 +33,9 @@ const supabase = createClient(
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// gemini-1.0-pro: universally available on free tier, no generationConfig needed.
-// JSON is enforced entirely via the prompt instruction + manual parsing.
-const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-1.0-pro',
-});
+// gemini-pro: legacy alias, widest availability on free tier.
+// No generationConfig, no systemInstruction — all persona & JSON rules go in the prompt.
+const geminiModel = genAI.getGenerativeModel({ model: 'gemini-pro' });
 
 // ─────────────────────────────────────────────────────────────
 // 3. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
@@ -89,11 +87,11 @@ async function processQueue() {
       return;
     }
 
-    // ── Step B: Build structured JSON prompt ────────────────
-    const prompt = buildPrompt(user, userMessage);
+    // ── Step B: Build full prompt with persona + JSON rules ──
+    const fullPrompt = buildPrompt(user, userMessage);
 
     // ── Step C: Call Gemini, parse JSON response ─────────────
-    const result  = await geminiModel.generateContent(prompt);
+    const result  = await geminiModel.generateContent(fullPrompt);
     const rawText = result.response.text();
 
     let feedback, score;
@@ -159,55 +157,19 @@ async function processQueue() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. PROMPT BUILDER — manual JSON enforcement for gemini-1.0-pro
+// 4. PROMPT BUILDER — full persona + JSON rules injected inline
+//    (gemini-pro has no systemInstruction or generationConfig)
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(user, userMessage) {
   const dailyMin = user.daily_time ?? 10;
-  return `
-You are a strict, sharp, and encouraging AI micro-learning mentor.
+  const fullPrompt = `You are a strict, encouraging AI micro-learning mentor. Your student's name is ${user.full_name}, their learning goal is "${user.goal}", their level is ${user.level}, and they have ${dailyMin} minutes today.
 
-Student Profile:
-- Name: ${user.full_name}
-- Learning Goal: ${user.goal}
-- Current Level: ${user.level}
-- Daily Study Budget: ${dailyMin} minutes
+You MUST evaluate the following student message and reply ONLY with a raw JSON object containing exactly two keys: "feedback" (string: your correction, explanation, and next question — plain text, no HTML, same language as the student) and "score" (integer 0 to 10: how correct their answer was; use 5 if they asked a question instead of answering one). Do not include markdown formatting, code blocks, backticks, or any text outside the JSON object. Your entire reply must start with { and end with }.
 
-Student's Message: "${userMessage}"
+Student's message: "${userMessage}"
 
-CRITICAL OUTPUT RULE — READ THIS FIRST:
-You MUST respond with a raw, valid JSON object containing EXACTLY two keys: "feedback" and "score".
-Do NOT add any text, explanation, or markdown outside the JSON object.
-Do NOT wrap the JSON in code blocks or backticks.
-Your entire response must start with { and end with }.
-
-JSON schema:
-{
-  "feedback": "<string: your educational response in the student's language, plain text only, no HTML>",
-  "score": <integer 0–10>
-}
-
-Scoring rubric:
-  0–3  : Incorrect or irrelevant answer.
-  4–6  : Partially correct; shows some understanding.
-  7–9  : Mostly correct with minor gaps.
-  10   : Completely correct and precise.
-  5    : Student asked a question (not answering one).
-
-Feedback rules:
-1. If the answer is wrong, state the mistake in ONE sentence, then give the correct answer in 2–3 sentences.
-2. Always follow up with the next exercise or question tied to the goal: "${user.goal}".
-3. End with one short motivational line.
-4. Be concise — the student has only ${dailyMin} minutes today.
-
-VALID example (structure only — do not copy content):
-{"feedback":"❌ Not quite. The correct answer is X because Y. Try this next: Z?","score":3}
-
-INVALID examples (never do this):
-\`\`\`json
-{"feedback":"...","score":3}
-\`\`\`
-Here is my response: {"feedback":"...","score":3}
-`.trim();
+Reply now with only the JSON object:`;
+  return fullPrompt;
 }
 
 // ─────────────────────────────────────────────────────────────
