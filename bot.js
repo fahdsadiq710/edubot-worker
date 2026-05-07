@@ -38,7 +38,32 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({ model: 'gemini-pro' });
 
 // ─────────────────────────────────────────────────────────────
-// 3. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
+// 3. DIAGNOSTIC — list every model the API key can access
+// ─────────────────────────────────────────────────────────────
+async function scanModels() {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('🔴 scanModels HTTP error:', response.status, JSON.stringify(data));
+      return;
+    }
+    console.log('🟢 AVAILABLE GOOGLE MODELS:');
+    if (data.models?.length) {
+      data.models.forEach((m) => console.log(' •', m.name));
+    } else {
+      console.log('  (no models returned — check API key permissions)');
+    }
+  } catch (e) {
+    console.error('🔴 Failed to scan models:', e.message);
+  }
+}
+scanModels();
+
+// ─────────────────────────────────────────────────────────────
+// 4. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
 //
 //    Free tier allows ~10–15 requests/min (≈1 req/6 s).
 //    Each queue item waits QUEUE_DELAY_MS before the next
@@ -87,6 +112,14 @@ async function processQueue() {
       return;
     }
 
+    // ── DIAGNOSTIC MODE: Gemini call temporarily disabled ────
+    // Re-enable Steps B–F once scanModels() confirms the correct model name.
+    await ctx.reply('🔧 System in diagnostic mode. Please wait for the admin to check the logs.');
+    isProcessing = false;
+    setTimeout(processQueue, QUEUE_DELAY_MS);
+    return;
+
+    /* eslint-disable no-unreachable */
     // ── Step B: Build full prompt with persona + JSON rules ──
     const fullPrompt = buildPrompt(user, userMessage);
 
@@ -98,15 +131,11 @@ async function processQueue() {
     try {
       ({ feedback, score } = parseGeminiJSON(rawText));
     } catch (parseErr) {
-      // ── Full debug dump so Render logs show exactly what Gemini returned ──
       console.error('━━━ [Queue] Gemini JSON parse failure ━━━');
       console.error('Error  :', parseErr.message);
-      // JSON.stringify reveals invisible characters (newlines, BOM, etc.)
       console.error('Raw    :', JSON.stringify(rawText));
       console.error('Cleaned:', JSON.stringify(stripMarkdownFences(rawText)));
       console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
-      // Fallback: send the raw text if it has content, otherwise a safe message
       await ctx.reply(
         rawText && rawText.trim().length > 0
           ? rawText.trim()
