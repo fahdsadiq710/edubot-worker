@@ -46,7 +46,11 @@ function buildSystemInstruction(targetGoal, currentStep) {
     `Return ONLY a JSON object with exactly two keys: ` +
     `"feedback" (string: your educational response and the next question for step ${currentStep}) ` +
     `and "score" (integer 0–10 evaluating the quality of their answer). ` +
-    `Do not include any text, markdown, or code blocks outside the JSON object.`
+    `Do not include any text, markdown, or code blocks outside the JSON object. ` +
+    `CRITICAL LANGUAGE RULE: You are bilingual. You MUST instantly adapt to the user's language. ` +
+    `If the user types in Arabic or requests Arabic, you MUST respond entirely in clear, professional Arabic. ` +
+    `However, you MUST keep all cybersecurity technical terms (e.g., CIA Triad, GRC, Malware, Phishing, Firewall, Encryption) ` +
+    `in English to preserve the integrity of the Security+ curriculum.`
   );
 }
 
