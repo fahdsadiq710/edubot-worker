@@ -34,23 +34,69 @@ const supabase = createClient(
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // gemini-2.5-flash: confirmed available on this API key.
-// systemInstruction sets the persona at the model level.
+// systemInstruction is built dynamically per-user (see buildSystemInstruction).
 // responseMimeType enforces strict JSON output — no fences, no prose.
-const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-2.5-flash',
-  systemInstruction:
-    'You are a strict Security+ mentor. Evaluate the user\'s answer. ' +
-    'Reply ONLY with a valid JSON object containing exactly two keys: ' +
-    '"feedback" (string: your educational response and the next question) ' +
-    'and "score" (integer 0–10 evaluating the quality of their answer). ' +
-    'Do not include any text, markdown, or code blocks outside the JSON object.',
-  generationConfig: {
-    responseMimeType: 'application/json',
-  },
-});
+const MODEL_NAME = 'gemini-2.5-flash';
+
+function buildSystemInstruction(targetGoal, currentStep) {
+  return (
+    `You are a strict mentor. The user's goal is "${targetGoal}" and they are currently on ` +
+    `step/lesson ${currentStep}. Do NOT ask questions outside this scope. ` +
+    `Evaluate the user's answer based on this context. ` +
+    `Return ONLY a JSON object with exactly two keys: ` +
+    `"feedback" (string: your educational response and the next question for step ${currentStep}) ` +
+    `and "score" (integer 0–10 evaluating the quality of their answer). ` +
+    `Do not include any text, markdown, or code blocks outside the JSON object.`
+  );
+}
 
 // ─────────────────────────────────────────────────────────────
-// 3. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
+// CONVERSATIONAL MEMORY — last 4 message pairs per telegram_id
+// Stored as arrays of Gemini history objects:
+//   { role: 'user'|'model', parts: [{ text }] }
+// The Map is in-process only; it resets on deploy (acceptable for MVP).
+// ─────────────────────────────────────────────────────────────
+const MAX_HISTORY = 4; // message pairs to retain per user
+/** @type {Map<number, Array<{ role: string, parts: Array<{ text: string }> }>>} */
+const chatHistories = new Map();
+
+// ─────────────────────────────────────────────────────────────
+// 3. ROADMAP HELPER
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the user's roadmap row from user_roadmaps.
+ * If no row exists, insert one with default goal 'Security+' at step 1.
+ *
+ * @param {number} telegramId
+ * @returns {Promise<{ target_goal: string, current_step: number }>}
+ */
+async function getRoadmap(telegramId) {
+  const { data, error } = await supabase
+    .from('user_roadmaps')
+    .select('target_goal, current_step')
+    .eq('telegram_id', telegramId)
+    .single();
+
+  if (data) return data;
+
+  // No row found (PGRST116) or other error — upsert default
+  const defaults = { target_goal: 'Security+', current_step: 1 };
+  const { data: inserted, error: insertErr } = await supabase
+    .from('user_roadmaps')
+    .upsert({ telegram_id: telegramId, ...defaults }, { onConflict: 'telegram_id' })
+    .select('target_goal, current_step')
+    .single();
+
+  if (insertErr) {
+    console.error('[getRoadmap] Failed to upsert default roadmap:', insertErr.message);
+    return defaults; // non-fatal: use in-memory defaults
+  }
+  return inserted;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 4. THE GEMINI SHIELD — RATE-LIMIT AWARE MESSAGE QUEUE
 //
 //    Free tier allows ~10–15 requests/min (≈1 req/6 s).
 //    Each queue item waits QUEUE_DELAY_MS before the next
@@ -70,7 +116,7 @@ async function processQueue() {
   const { ctx, telegramId, userMessage } = messageQueue.shift();
 
   try {
-    // ── Step A: Security check — fetch user from DB ──────────
+    // ── Step A: Security check ───────────────────────────────
     const { data: user, error: dbError } = await supabase
       .from('users')
       .select('id, full_name, goal, level, daily_time, is_active')
@@ -94,11 +140,28 @@ async function processQueue() {
       return;
     }
 
-    // ── Step B: Build prompt ─────────────────────────────────
-    const prompt = buildPrompt(user, userMessage);
+    // ── Step B: Fetch roadmap (upserts default if missing) ───
+    const roadmap = await getRoadmap(telegramId);
+    const { target_goal, current_step } = roadmap;
 
-    // ── Step C: Call Gemini, parse structured JSON response ──
-    const result  = await geminiModel.generateContent(prompt);
+    // ── Step C: Build per-request Gemini model with dynamic SI
+    const requestModel = genAI.getGenerativeModel({
+      model: MODEL_NAME,
+      systemInstruction: buildSystemInstruction(target_goal, current_step),
+      generationConfig:  { responseMimeType: 'application/json' },
+    });
+
+    // ── Step D: Retrieve / initialise this user's chat history
+    if (!chatHistories.has(telegramId)) {
+      chatHistories.set(telegramId, []);
+    }
+    const history = chatHistories.get(telegramId);
+
+    // Start a chat session with the existing history
+    const chat = requestModel.startChat({ history });
+
+    // ── Step E: Send message, receive structured JSON ─────────
+    const result  = await chat.sendMessage(buildPrompt(user, userMessage, target_goal, current_step));
     const rawText = result.response.text();
 
     let feedback, score;
@@ -120,17 +183,27 @@ async function processQueue() {
       return;
     }
 
-    // ── Step D: Send only the feedback text to the student ───
+    // ── Step F: Update in-memory chat history (cap at MAX_HISTORY pairs)
+    history.push(
+      { role: 'user',  parts: [{ text: userMessage }] },
+      { role: 'model', parts: [{ text: rawText       }] }
+    );
+    // Keep only the last MAX_HISTORY pairs (each pair = 2 entries)
+    if (history.length > MAX_HISTORY * 2) {
+      history.splice(0, history.length - MAX_HISTORY * 2);
+    }
+
+    // ── Step G: Send only the feedback text to the student ───
     await ctx.reply(feedback);
 
-    // ── Step E: Silently log score to progress_logs ──────────
+    // ── Step H: Silently log score to progress_logs ──────────
     await logUserProgress(telegramId, score, extractTopic(userMessage));
 
-    // ── Step F: Update the main progress table ───────────────
+    // ── Step I: Update the main progress table ───────────────
     await supabase.from('progress').insert({
       user_id:    user.id,
       topic:      extractTopic(userMessage),
-      evaluation: `Score: ${score}/10`,
+      evaluation: `Score: ${score}/10 | Goal: ${target_goal} | Step: ${current_step}`,
       mistakes:   [],
       timestamp:  new Date().toISOString(),
     });
@@ -160,17 +233,18 @@ async function processQueue() {
 // ─────────────────────────────────────────────────────────────
 // 4. PROMPT BUILDER
 // ─────────────────────────────────────────────────────────────
-function buildPrompt(user, userMessage) {
+function buildPrompt(user, userMessage, targetGoal, currentStep) {
   const dailyMin = user.daily_time ?? 10;
   return `Student Profile:
 - Name: ${user.full_name}
-- Learning Goal: ${user.goal}
 - Level: ${user.level}
 - Daily budget: ${dailyMin} minutes
+- Current goal: ${targetGoal}
+- Current lesson/step: ${currentStep}
 
 Student's message: "${userMessage}"
 
-Evaluate the student's message. Reply with only a valid JSON object with keys "feedback" and "score".`;
+Evaluate the student's message in the context of step ${currentStep} of ${targetGoal}. Reply with only a valid JSON object with keys "feedback" and "score".`;
 }
 
 // ─────────────────────────────────────────────────────────────
